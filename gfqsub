@@ -1,0 +1,293 @@
+#!/home/okazaki/local/python/bin/python
+
+import ConfigParser
+import datetime
+import logging
+import optparse
+import os
+import sys
+import threading
+import fnmatch
+import subprocess
+import Queue
+import paramiko
+import socket
+
+CONFIGNAME = '~/.gfqsub'
+
+class InterruptableQueue(Queue.Queue):
+    def __init__(self, maxsize):
+        Queue.Queue.__init__(self, maxsize)
+
+    def get(self, blocking):
+        while 1:
+            try:
+                return Queue.Queue.get(self, blocking, 1)
+            except Queue.Empty:
+                pass
+
+class PathToHost:
+    def __call__(self, host):
+        return host
+
+class GFarmPathToHost:
+    def __init__(self, root=None):
+        if root is None:
+            config = ConfigParser.ConfigParser()
+            config.read(os.path.expanduser(CONFIGNAME))
+            self.root = config.get('gfarm', 'root')
+        else:
+            self.root = root
+
+    def __call__(self, path):
+        relpath = os.path.relpath(path, self.root)
+        pipe = subprocess.Popen(["gfwhere", relpath], stdout=subprocess.PIPE)
+        output = pipe.communicate()[0]
+        return output.strip('\n').replace(' ', ',')
+
+class Task:
+    def __init__(self, name='', cmd='', hosts=set()):
+        self.name = name
+        self.cmd = cmd
+        self.hosts = hosts
+        self.cwd = os.getcwd()
+        self.host = ''
+        self.start = ''
+        self.end = ''
+        self.retcode = None
+        self.lock = threading.Lock()
+
+    def __str__(self):
+        return '%s %r %s %s %s %s' % (
+            self.name,
+            self.retcode,
+            self.host,
+            self.end - self.start if self.end and self.start else '0',
+            self.start.isoformat(),
+            self.end.isoformat()
+            )
+
+    def acquire(self):
+        return self.lock.acquire(False)
+
+
+class WorkerError(RuntimeError): pass
+
+class Worker:
+    def __init__(self, host='', cid=0):
+        self.host = host
+        self.cid = cid
+
+        # Establish an SSH connection to the server.
+        try:
+            self.client = paramiko.SSHClient()
+            self.client.load_system_host_keys()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.client.connect(host)
+
+        except Exception, e:
+            raise WorkerError('could not connect to %s\n%s: %s' % (host, type(e).__name__, str(e)))
+    
+    def __str__(self):
+        return '%s,%d' % (self.host, self.cid)
+
+    def run(self, task, q):
+        # Start a thread that monitors the execution of the task.
+        thread = threading.Thread(
+            name=str(self),
+            target=self.__run,
+            args=(task, q)
+            )
+        thread.daemon = True
+        thread.start()
+
+    def __run(self, task, q):
+        # Invoke a shell on the SSH connection.
+        channel = self.client.invoke_shell()
+        channel.settimeout(1.0)
+
+        # Run the task.
+        cmd = 'cd %s\n%s\nexit\n' % (task.cwd, task.cmd)
+        task.start = datetime.datetime.now()
+        channel.send(cmd)
+
+        # Wait for the task to complete.
+        while not channel.exit_status_ready():
+            self.__drain(channel.recv)
+            self.__drain(channel.recv_stderr)
+
+        # Record the status of the task.
+        task.end = datetime.datetime.now()
+        task.retcode = channel.recv_exit_status()
+        task.host = self.host
+
+        # Close the shell.
+        channel.close()
+
+        # Notify the completion of the task.
+        q.put((self, task))
+
+    def __drain(self, func):
+        nbytes = 4096
+        try:
+            while 1:
+                data = func(nbytes)
+                if len(data) < nbytes:
+                    break
+        except socket.timeout:
+            pass
+
+
+class WorkerFormatError(ValueError): pass
+class TaskFormatError(ValueError): pass
+
+class Sched:
+    def __init__(self):
+        self.tasks = []
+        self.workers = []
+        self.min = 0
+
+    def read_workers(self, name):
+        config = ConfigParser.ConfigParser()
+        config.read(os.path.expanduser(CONFIGNAME))
+        values = config.get('hosts', name).split()
+        for value in values:
+            fields = value.split(':')
+            if len(fields) == 1:
+                self.workers.append(Worker(fields[0]))
+            elif len(fields) == 2:
+                for i in range(int(fields[1])):
+                    self.workers.append(Worker(fields[0], i))
+            else:
+                raise WorkerFormatError('too many fields: %s' % value)
+
+    def read_tasks(self, fi, hostconv):
+        H = set([worker.host for worker in self.workers])
+        n = 0
+        for line in fi:
+            n += 1
+            line = line.strip('\n')
+            if not line or line.startswith('#'):
+                # Ignore a comment line.
+                continue
+            fields = line.split(' ')
+            if len(fields) < 3:
+                raise TaskFormatError('too few fields in lines %d' % n)
+            name = fields[0]
+            patterns = hostconv(fields[1]).split(',')
+            cmd = ' '.join(fields[2:])
+
+            # Expand the host pattern(s).
+            hosts = set()
+            for pattern in patterns:
+                hs = fnmatch.filter(H, pattern)
+                if not hs:
+                    raise TaskFormatError('unknown host specified in lines %d: %s' % (n, pattern))
+                for h in hs:
+                    hosts.add(h)
+            self.tasks.append(Task(name, cmd, hosts))
+    
+    def run(self, fr, ff):
+        n = 0
+        N = len(self.tasks)
+        logger = logging.getLogger('qsubssh')
+        logger.info('run %d tasks on %d workers' % (N, len(self.workers)))
+
+        # Initialize a queue with all the workers (with empty tasks).
+        q = InterruptableQueue(len(self.workers))
+        for worker in self.workers:
+            q.put((worker, None))
+
+        # Loop until all tasks are done.
+        while n < len(self.tasks):
+            # Get a free worker and its previous task.
+            worker, task = q.get(True)
+            if task is not None:
+                # The worker has completed the task obtained from the queue.
+                n += 1
+                if task.retcode is not None:
+                    logger.info('[%d/%d] finished (%d) %s on %s in %s' % (n, N, task.retcode, task.name, task.host, task.end - task.start))
+                else:
+                    # The task was not executed.
+                    logging.info('[%d/%d] failed %s on %s' % (n, N, task.name, task.host))                
+                fr.write('%s\n' % task)
+                fr.flush()
+                if task.retcode != 0:
+                    ff.write('%s %s %s\n' % (task.name, ','.join(task.hosts), task.cmd))
+                    ff.flush()
+            logger.info('%s is available' % worker)
+
+            # Find a task that can be run on the worker.
+            task = None
+            for i in range(self.min, len(self.tasks)):
+                # Check if the task can be run on the worker.
+                if worker.host in self.tasks[i].hosts:
+                    # Try to lock the task.
+                    if self.tasks[i].acquire():
+                        if i == self.min:
+                            self.min += 1
+                        task = self.tasks[i]
+                        break
+
+            if task is not None:
+                # Run the task.
+                logger.info('%s on %s: %s' % (task.name, worker.host, task.cmd))
+                worker.run(task, q)
+
+if __name__ == '__main__':
+    # Initialize the default root logger.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(message)s',
+        stream=sys.stdout
+        )
+
+    # Parse the command-line options.
+    parser = optparse.OptionParser()
+    parser.add_option(
+        '-w', '--workers',
+        help='specify a list of servers that run the tasks'
+        )
+    parser.add_option(
+        '-n', '--name',
+        help='specify the prefix of output files and directory'
+        )
+    parser.add_option(
+        '-l', '--log', action='store_true',
+        help='write log messages to a file (in addition to STDOUT)'
+        )
+    parser.add_option(
+        '-v', '--verbose', action='store_true',
+        help='verbose mode (output debugging information)'
+        )
+    (options, args) = parser.parse_args()
+
+    # Determine file names for reporting the progress.
+    report = '.'.join((options.name, 'report')) if options.name else 'report'
+    failed = '.'.join((options.name, 'failed')) if options.name else 'failed'
+    log = '.'.join((options.name, 'log')) if options.name else 'log'
+
+    # Add a file hander to the logger if necessary.
+    if options.log:
+        handler = logging.FileHandler(log, 'w')
+        handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s %(name)s %(message)s')
+        handler.setFormatter(formatter)
+        logging.getLogger('').addHandler(handler)
+
+    # Set the logging level.
+    if options.verbose:
+        logging.getLogger('qsubssh').setLevel(logging.DEBUG)
+        logging.getLogger('paramiko').setLevel(logging.DEBUG)
+    else:
+        logging.getLogger('qsubssh').setLevel(logging.INFO)
+        logging.getLogger('paramiko').setLevel(logging.WARNING)
+
+    # Prepare the scheduler.
+    sched = Sched()
+    hostconv = GFarmPathToHost()
+    sched.read_workers(options.workers)
+    sched.read_tasks(sys.stdin, hostconv)
+
+    # Run the job.
+    sched.run(open(report, 'a'), open(failed, 'w'))

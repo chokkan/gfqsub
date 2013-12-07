@@ -1,0 +1,24 @@
+[gfarm]
+# The root directory where the gfarm volume is mounted.
+root = /path/to/gfarm/volume
+
+[hosts]
+# Define a set of servers where you want to run the job.
+server1 = server01.hoge.com
+          server02.hoge.com
+          server03.hoge.com
+          server04.hoge.com
+          server05.hoge.com
+          server06.hoge.com
+          server07.hoge.com
+          server08.hoge.com
+
+# Your Define a set of servers where one wants to run the job.
+server4 = server01.hoge.com:4
+          server02.hoge.com;4
+          server03.hoge.com;4
+          server04.hoge.com;4
+          server05.hoge.com;4
+          server06.hoge.com;4
+          server07.hoge.com:4
+          server08.hoge.com;4
